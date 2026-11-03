@@ -253,7 +253,7 @@ namespace LiveCaptionsTranslator.models
             string apiUrl = config switch
             {
                 OpenAIConfig openAIUrlConfig => openAIUrlConfig.ApiUrl,
-                OllamaConfig ollamaConfig => ollamaConfig.ApiUrl,
+                OllamaConfig ollamaUrlConfig => ollamaUrlConfig.ApiUrl,
                 LMStudioConfig lmStudioConfig => lmStudioConfig.ApiUrl,
                 DeepLConfig deepLUrlConfig => deepLUrlConfig.ApiUrl,
                 YoudaoConfig youdaoUrlConfig => youdaoUrlConfig.ApiUrl,
