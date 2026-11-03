@@ -226,40 +226,40 @@ namespace LiveCaptionsTranslator.models
             var config = this[ApiName];
             var parameters = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["AppKey"] = config is YoudaoConfig youdao ? youdao.AppKey : string.Empty,
-                ["AppSecret"] = config is YoudaoConfig youdaoConfig ? youdaoConfig.AppSecret : string.Empty,
-                ["AppId"] = config is BaiduConfig baidu ? baidu.AppId : string.Empty,
-                ["SourceLanguage"] = config is MTranServerConfig mtran ? mtran.SourceLanguage : string.Empty
+                ["AppKey"] = config is YoudaoConfig youdaoConfigValue ? youdaoConfigValue.AppKey : string.Empty,
+                ["AppSecret"] = config is YoudaoConfig youdaoSecretConfig ? youdaoSecretConfig.AppSecret : string.Empty,
+                ["AppId"] = config is BaiduConfig baiduConfigValue ? baiduConfigValue.AppId : string.Empty,
+                ["SourceLanguage"] = config is MTranServerConfig mtranConfigValue ? mtranConfigValue.SourceLanguage : string.Empty
             };
 
             var llmConfig = config as BaseLLMConfig;
             var protocol = OpenAIProtocol.ChatCompletions;
             var stream = false;
-            if (config is OpenAIConfig openAI)
+            if (config is OpenAIConfig openAIConfig)
             {
-                Enum.TryParse(openAI.Protocol, ignoreCase: true, out protocol);
-                stream = openAI.Stream;
+                Enum.TryParse(openAIConfig.Protocol, ignoreCase: true, out protocol);
+                stream = openAIConfig.Stream;
             }
 
             string apiKey = config switch
             {
-                OpenAIConfig openAI => openAI.ApiKey,
-                OpenRouterConfig openRouter => openRouter.ApiKey,
-                DeepLConfig deepL => deepL.ApiKey,
-                MTranServerConfig mtranServer => mtranServer.ApiKey,
-                LibreTranslateConfig libre => libre.ApiKey,
+                OpenAIConfig openAIKeyConfig => openAIKeyConfig.ApiKey,
+                OpenRouterConfig openRouterConfig => openRouterConfig.ApiKey,
+                DeepLConfig deepLConfig => deepLConfig.ApiKey,
+                MTranServerConfig mtranKeyConfig => mtranKeyConfig.ApiKey,
+                LibreTranslateConfig libreConfig => libreConfig.ApiKey,
                 _ => string.Empty
             };
             string apiUrl = config switch
             {
-                OpenAIConfig openAI => openAI.ApiUrl,
-                OllamaConfig ollama => ollama.ApiUrl,
-                LMStudioConfig lmStudio => lmStudio.ApiUrl,
-                DeepLConfig deepL => deepL.ApiUrl,
-                YoudaoConfig youdao => youdao.ApiUrl,
-                MTranServerConfig mtranServer => mtranServer.ApiUrl,
-                BaiduConfig baidu => baidu.ApiUrl,
-                LibreTranslateConfig libre => libre.ApiUrl,
+                OpenAIConfig openAIUrlConfig => openAIUrlConfig.ApiUrl,
+                OllamaConfig ollamaConfig => ollamaConfig.ApiUrl,
+                LMStudioConfig lmStudioConfig => lmStudioConfig.ApiUrl,
+                DeepLConfig deepLUrlConfig => deepLUrlConfig.ApiUrl,
+                YoudaoConfig youdaoUrlConfig => youdaoUrlConfig.ApiUrl,
+                MTranServerConfig mtranUrlConfig => mtranUrlConfig.ApiUrl,
+                BaiduConfig baiduUrlConfig => baiduUrlConfig.ApiUrl,
+                LibreTranslateConfig libreUrlConfig => libreUrlConfig.ApiUrl,
                 _ => string.Empty
             };
 

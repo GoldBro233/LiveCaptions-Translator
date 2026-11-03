@@ -66,7 +66,8 @@ namespace LiveCaptionsTranslator.apis
             Func<CancellationToken, Task<string>> operation,
             [EnumeratorCancellation] CancellationToken token = default)
         {
-            string result;
+            string? error = null;
+            string result = string.Empty;
             try
             {
                 result = await operation(token);
@@ -77,10 +78,14 @@ namespace LiveCaptionsTranslator.apis
             }
             catch (Exception ex)
             {
-                yield return new TranslationUpdate(TranslationUpdateKind.Failed, Error: ex.Message);
-                yield break;
+                error = ex.Message;
             }
 
+            if (error != null)
+            {
+                yield return new TranslationUpdate(TranslationUpdateKind.Failed, Error: error);
+                yield break;
+            }
             if (result.StartsWith("[ERROR]", StringComparison.Ordinal))
             {
                 yield return new TranslationUpdate(TranslationUpdateKind.Failed, Error: result);
