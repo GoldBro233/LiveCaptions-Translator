@@ -609,16 +609,16 @@
                                                 Margin="15,0,0,0"
                                                 Orientation="Vertical">
                                                 <StackPanel VerticalAlignment="Center" Orientation="Horizontal">
-                                                    <ui:TextBlock Margin="2.5,0,0,5" Text="API Url" />
+                                                    <ui:TextBlock Margin="2.5,0,0,5" Text="API URL (Base)" />
                                                     <ui:Flyout x:Name="OpenAIAPIUrlInfoFlyout">
                                                         <ui:TextBlock Width="300" TextWrapping="Wrap">
-                                                            <Run Text="Use Full Url (typically ending with" />
-                                                            <Run FontWeight="Bold" Text="`v1/chat/completions`" />
-                                                            <Run Text="for Chat Completions or" />
-                                                            <Run FontWeight="Bold" Text="`v1/responses`" />
-                                                            <Run Text="for Responses, instead of a Base Url (typically ending with just" />
-                                                            <Run FontWeight="Bold" Text="`v1`" />
-                                                            <Run Text="). Streaming requires support from the selected endpoint." />
+                                                            <Run Text="Use a Base URL ending with" />
+                                                            <Run FontWeight="Bold" Text="`/v1`" />
+                                                            <Run Text=". The selected protocol appends" />
+                                                            <Run FontWeight="Bold" Text="`/chat/completions`" />
+                                                            <Run Text="or" />
+                                                            <Run FontWeight="Bold" Text="`/responses`" />
+                                                            <Run Text="automatically. Streaming still requires endpoint support." />
                                                         </ui:TextBlock>
                                                     </ui:Flyout>
                                                     <Button

@@ -62,6 +62,28 @@ namespace LiveCaptionsTranslator.apis
                 yield return update;
         }
 
+        public static string NormalizeOpenAIBaseUrl(string url)
+        {
+            string baseUrl = TextUtil.NormalizeUrl(url);
+            if (baseUrl.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
+                return baseUrl[..^"/chat/completions".Length];
+            if (baseUrl.EndsWith("/responses", StringComparison.OrdinalIgnoreCase))
+                return baseUrl[..^"/responses".Length];
+            return baseUrl;
+        }
+
+        public static string ResolveOpenAIEndpoint(TranslationSettingsSnapshot settings)
+        {
+            string baseUrl = NormalizeOpenAIBaseUrl(settings.ApiUrl);
+            if (baseUrl.Length == 0)
+                return baseUrl;
+
+            string protocolSuffix = settings.Protocol == OpenAIProtocol.Responses
+                ? "/responses"
+                : "/chat/completions";
+            return baseUrl + protocolSuffix;
+        }
+
         private static async IAsyncEnumerable<TranslationUpdate> SingleResultAsync(
             Func<CancellationToken, Task<string>> operation,
             [EnumeratorCancellation] CancellationToken token = default)
@@ -133,7 +155,7 @@ namespace LiveCaptionsTranslator.apis
             }
 
             using var response = await SendJsonAsync(
-                request.Settings.ApiUrl,
+                ResolveOpenAIEndpoint(request.Settings),
                 body,
                 request.Settings.ApiKey,
                 token);
@@ -182,7 +204,8 @@ namespace LiveCaptionsTranslator.apis
             BaseLLMRequestData body,
             CancellationToken token)
         {
-            using var response = await SendJsonAsync(request.Settings.ApiUrl, body, request.Settings.ApiKey, token);
+            using var response = await SendJsonAsync(
+                ResolveOpenAIEndpoint(request.Settings), body, request.Settings.ApiKey, token);
             if (!response.IsSuccessStatusCode)
                 return await ReadHttpErrorAsync(response, token);
 
@@ -226,7 +249,7 @@ namespace LiveCaptionsTranslator.apis
             }
 
             using var response = await SendJsonAsync(
-                request.Settings.ApiUrl,
+                ResolveOpenAIEndpoint(request.Settings),
                 body,
                 request.Settings.ApiKey,
                 token);

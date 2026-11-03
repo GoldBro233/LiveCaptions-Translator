@@ -334,6 +334,12 @@ namespace LiveCaptionsTranslator.models
                     setting.ConfigIndices[key] = 0;
             }
 
+            if (setting.Configs.TryGetValue("OpenAI", out var openAIConfigs))
+            {
+                foreach (var openAIConfig in openAIConfigs.OfType<OpenAIConfig>())
+                    openAIConfig.ApiUrl = TranslateAPI.NormalizeOpenAIBaseUrl(openAIConfig.ApiUrl);
+            }
+
             return setting;
         }
 

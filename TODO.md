@@ -63,7 +63,7 @@
 
 依赖阶段 1 的统一输出契约，并接入阶段 2 缓存。
 
-- [x] 在现有 OpenAI 配置中增加 Chat Completions／Responses 协议选择及流式开关。旧配置缺省为 Chat Completions、非流式；沿用完整 URL 输入约定，提供对应端点说明，不自动改写用户 URL。
+- [x] 在现有 OpenAI 配置中增加 Chat Completions／Responses 协议选择及流式开关。旧配置缺省为 Chat Completions、非流式；改为填写以 `/v1` 结尾的 Base URL，由协议选择自动补全 endpoint；兼容旧的完整 URL，不自动尝试其他协议。
 - [x] 实现 Responses 的非流式与流式请求，按官方协议构造 `input`／`instructions` 并提取输出文本；处理 `response.output_text.delta`、完成、失败和未完整结束等事件。上下文由客户端显式提交，不串联服务端 response ID；使用 `store: false`。
 - [x] 实现 Chat Completions SSE；Responses 流式事件由上一项处理。OpenRouter、Ollama 和 LM Studio 保留现有非流式完整返回路径，不新增流式事件解析。
 - [x] 使用响应头到达即可读取的 HTTP 模式，增量解析 UTF-8 和完整事件／记录；正确处理网络分块、跨块字符、多行 SSE 数据和结束标记，不能把一次网络读取当成一个 JSON。
