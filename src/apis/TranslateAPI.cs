@@ -144,6 +144,7 @@ namespace LiveCaptionsTranslator.apis
             }
 
             bool completed = false;
+            var reasoningFilter = new ReasoningTextFilter();
             await foreach (var item in ReadSseAsync(response, token).WithCancellation(token))
             {
                 if (item.Data == "[DONE]")
@@ -158,17 +159,22 @@ namespace LiveCaptionsTranslator.apis
                     yield break;
                 }
 
-                if (delta.Length > 0)
-                    yield return new TranslationUpdate(TranslationUpdateKind.Text, delta);
+                string visibleDelta = reasoningFilter.Append(delta);
+                if (visibleDelta.Length > 0)
+                    yield return new TranslationUpdate(TranslationUpdateKind.Text, visibleDelta);
                 if (finishReason != null)
                     completed = true;
             }
 
+            string remainingText = reasoningFilter.Flush();
+            if (remainingText.Length > 0)
+                yield return new TranslationUpdate(TranslationUpdateKind.Text, remainingText);
             yield return completed
                 ? new TranslationUpdate(TranslationUpdateKind.Completed)
                 : new TranslationUpdate(
                     TranslationUpdateKind.Incomplete,
                     Error: "The OpenAI Chat Completions stream ended before completion.");
+
         }
 
         private static async Task<string> SendOpenAIChatCompletionsAsync(
@@ -231,6 +237,7 @@ namespace LiveCaptionsTranslator.apis
             }
 
             bool completed = false;
+            var reasoningFilter = new ReasoningTextFilter();
             await foreach (var item in ReadSseAsync(response, token).WithCancellation(token))
             {
                 string eventType = item.Event;
@@ -246,8 +253,9 @@ namespace LiveCaptionsTranslator.apis
                             Error: "OpenAI Responses delta is missing text.");
                         yield break;
                     }
-                    if (delta.Length > 0)
-                        yield return new TranslationUpdate(TranslationUpdateKind.Text, delta);
+                    string visibleDelta = reasoningFilter.Append(delta);
+                    if (visibleDelta.Length > 0)
+                        yield return new TranslationUpdate(TranslationUpdateKind.Text, visibleDelta);
                 }
                 else if (eventType == "response.completed")
                 {
@@ -269,13 +277,16 @@ namespace LiveCaptionsTranslator.apis
                 }
             }
 
+            string remainingText = reasoningFilter.Flush();
+            if (remainingText.Length > 0)
+                yield return new TranslationUpdate(TranslationUpdateKind.Text, remainingText);
             yield return completed
                 ? new TranslationUpdate(TranslationUpdateKind.Completed)
                 : new TranslationUpdate(
                     TranslationUpdateKind.Incomplete,
                     Error: "The OpenAI Responses stream ended before completion.");
-        }
 
+        }
         private static async Task<string> SendOpenAIResponsesAsync(
             TranslationRequest request,
             object body,
@@ -802,7 +813,7 @@ namespace LiveCaptionsTranslator.apis
                 if (choice.TryGetProperty("delta", out var deltaElement) &&
                     deltaElement.TryGetProperty("content", out var content) &&
                     content.ValueKind == JsonValueKind.String)
-                    delta = RemoveModelThinking(content.GetString() ?? string.Empty);
+                    delta = content.GetString() ?? string.Empty;
                 return true;
             }
             catch (JsonException ex)
@@ -868,6 +879,86 @@ namespace LiveCaptionsTranslator.apis
             catch (JsonException)
             {
                 return null;
+            }
+        }
+
+        private sealed class ReasoningTextFilter
+        {
+            private const string OpenTag = "<think>";
+            private const string CloseTag = "</think>";
+            private string pending = string.Empty;
+            private bool inReasoning;
+
+            public string Append(string value)
+            {
+                if (value.Length == 0)
+                    return string.Empty;
+                pending += value;
+                var visible = new StringBuilder();
+
+                while (pending.Length > 0)
+                {
+                    if (inReasoning)
+                    {
+                        int closeIndex = pending.IndexOf(CloseTag, StringComparison.Ordinal);
+                        if (closeIndex < 0)
+                        {
+                            pending = KeepTagPrefix(pending, CloseTag);
+                            break;
+                        }
+                        pending = pending[(closeIndex + CloseTag.Length)..];
+                        inReasoning = false;
+                        continue;
+                    }
+
+                    int openIndex = pending.IndexOf(OpenTag, StringComparison.Ordinal);
+                    if (openIndex >= 0)
+                    {
+                        visible.Append(pending[..openIndex]);
+                        pending = pending[(openIndex + OpenTag.Length)..];
+                        inReasoning = true;
+                        continue;
+                    }
+
+                    int possibleTagLength = TagPrefixLength(pending, OpenTag);
+                    if (possibleTagLength == pending.Length)
+                        break;
+                    int visibleLength = pending.Length - possibleTagLength;
+                    visible.Append(pending[..visibleLength]);
+                    pending = possibleTagLength == 0 ? string.Empty : pending[visibleLength..];
+                    break;
+                }
+
+                return visible.ToString();
+            }
+
+            public string Flush()
+            {
+                if (inReasoning)
+                {
+                    pending = string.Empty;
+                    return string.Empty;
+                }
+                string value = pending;
+                pending = string.Empty;
+                return value;
+            }
+
+            private static string KeepTagPrefix(string value, string tag)
+            {
+                int length = TagPrefixLength(value, tag);
+                return length == 0 ? string.Empty : value[^length..];
+            }
+
+            private static int TagPrefixLength(string value, string tag)
+            {
+                int maximum = Math.Min(value.Length, tag.Length - 1);
+                for (int length = maximum; length > 0; length--)
+                {
+                    if (value.EndsWith(tag[..length], StringComparison.Ordinal))
+                        return length;
+                }
+                return 0;
             }
         }
 
