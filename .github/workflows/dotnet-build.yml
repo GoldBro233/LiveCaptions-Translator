@@ -48,7 +48,7 @@ jobs:
           del ./publish/arm64/framework/*.pdb 2>nul || echo "No pdb found in arm64 framework"
 
       - name: Run Tests
-        run: dotnet test --verbosity normal
+        run: dotnet test ./tests/LiveCaptionsTranslator.Tests/LiveCaptionsTranslator.Tests.csproj --verbosity normal
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
