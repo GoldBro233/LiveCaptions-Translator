@@ -1,6 +1,5 @@
-﻿using System.Diagnostics;
-using System.IO;
-using System.Text;
+﻿using System.Text;
+using System.Windows;
 using System.Windows.Automation;
 
 using LiveCaptionsTranslator.apis;
@@ -11,29 +10,53 @@ namespace LiveCaptionsTranslator
 {
     public static class Translator
     {
-        private static AutomationElement? window = null;
-        private static Caption? caption = null;
-        private static Setting? setting = null;
-
-        private static readonly Queue<string> pendingTextQueue = new();
+        private static readonly object stateLock = new();
+        private static readonly CaptionSentenceTracker sentenceTracker = new();
         private static readonly TranslationTaskQueue translationTaskQueue = new();
+        private static readonly SemaphoreSlim historyLock = new(1, 1);
+        private static readonly CancellationTokenSource lifetime = new();
+        private static readonly Dictionary<long, PendingCaption> pending = new();
+        private static readonly Dictionary<long, int> latestRevisions = new();
+
+        private static AutomationElement? window;
+        private static Caption? caption;
+        private static Setting? setting;
+        private static Guid sessionId = Guid.NewGuid();
+        private static long? currentSentenceId;
+        private static TranslationRequest? activeRequest;
+        private static bool logOnlyFlag;
+        private static bool initialized;
+
+        private static readonly TimeSpan TranslationThrottle = TimeSpan.FromMilliseconds(300);
+        private static readonly TimeSpan TranslationMaxWait = TimeSpan.FromMilliseconds(1200);
 
         public static AutomationElement? Window
         {
             get => window;
             set => window = value;
         }
-        public static Caption? Caption => caption;
-        public static Setting? Setting => setting;
 
-        public static bool LogOnlyFlag { get; set; } = false;
-        public static bool FirstUseFlag { get; set; } = false;
+        public static Caption Caption => caption!;
+        public static Setting Setting => setting!;
 
+        public static bool LogOnlyFlag
+        {
+            get => logOnlyFlag;
+            set
+            {
+                if (logOnlyFlag == value)
+                    return;
+                logOnlyFlag = value;
+                BeginNewSession(clearContexts: true, resetTracker: true);
+            }
+        }
+
+        public static bool FirstUseFlag { get; set; }
         public static event Action? TranslationLogged;
 
         static Translator()
         {
-            window = LiveCaptionsHandler.LaunchLiveCaptions();
+            Window = LiveCaptionsHandler.LaunchLiveCaptions();
             LiveCaptionsHandler.FixLiveCaptions(Window);
             LiveCaptionsHandler.HideLiveCaptions(Window);
 
@@ -42,319 +65,430 @@ namespace LiveCaptionsTranslator
 
             caption = Caption.GetInstance();
             setting = Setting.Load();
+            translationTaskQueue.Updated += OnTranslationUpdated;
+            initialized = true;
         }
 
         public static void SyncLoop()
         {
-            int idleCount = 0;
-            int syncCount = 0;
-
-            while (true)
+            while (!lifetime.IsCancellationRequested)
             {
                 if (Window == null)
                 {
-                    Thread.Sleep(2000);
+                    Window = LiveCaptionsHandler.LaunchLiveCaptions();
+                    LiveCaptionsHandler.FixLiveCaptions(Window);
+                    LiveCaptionsHandler.HideLiveCaptions(Window);
+                    BeginNewSession(clearContexts: true, resetTracker: true);
+                    Wait(2000);
                     continue;
                 }
 
-                string fullText = string.Empty;
+                string fullText;
                 try
                 {
-                    // Check LiveCaptions.exe still alive
-                    var info = Window.Current;
-                    var name = info.Name;
-                    // Get the text recognized by LiveCaptions (10-20ms)
+                    _ = Window.Current.Name;
                     fullText = LiveCaptionsHandler.GetCaptions(Window);
                 }
                 catch (ElementNotAvailableException)
                 {
                     Window = null;
+                    BeginNewSession(clearContexts: true, resetTracker: true);
                     continue;
                 }
-                if (string.IsNullOrEmpty(fullText))
+
+                if (string.IsNullOrWhiteSpace(fullText))
+                {
+                    Wait(25);
                     continue;
-
-                // Preprocess
-                fullText = RegexPatterns.Acronym().Replace(fullText, "$1$2");
-                fullText = RegexPatterns.AcronymWithWords().Replace(fullText, "$1 $2");
-                fullText = RegexPatterns.PunctuationSpace().Replace(fullText, "$1 ");
-                fullText = RegexPatterns.CJPunctuationSpace().Replace(fullText, "$1");
-                // Note: For certain languages (such as Japanese), LiveCaptions excessively uses `\n`.
-                // Replace redundant `\n` within sentences with comma or period.
-                fullText = TextUtil.ReplaceNewlines(fullText, TextUtil.MEDIUM_THRESHOLD);
-
-                // Prevent adding the last sentence from previous running to log cards
-                // before the first sentence is completed.
-                if (fullText.IndexOfAny(TextUtil.PUNC_EOS) == -1 && Caption.Contexts.Count > 0)
-                    ClearContexts();
-
-                // Get the last sentence.
-                int lastEOSIndex;
-                if (Array.IndexOf(TextUtil.PUNC_EOS, fullText[^1]) != -1)
-                    lastEOSIndex = fullText[0..^1].LastIndexOfAny(TextUtil.PUNC_EOS);
-                else
-                    lastEOSIndex = fullText.LastIndexOfAny(TextUtil.PUNC_EOS);
-                string latestCaption = fullText.Substring(lastEOSIndex + 1);
-
-                // If the last sentence is too short, extend it by adding the previous sentence.
-                // Note: LiveCaptions may generate multiple characters including EOS at once.
-                if (lastEOSIndex > 0 && Encoding.UTF8.GetByteCount(latestCaption) < TextUtil.SHORT_THRESHOLD)
-                {
-                    lastEOSIndex = fullText[0..lastEOSIndex].LastIndexOfAny(TextUtil.PUNC_EOS);
-                    latestCaption = fullText.Substring(lastEOSIndex + 1);
                 }
 
-                // `OverlayOriginalCaption`: The sentence to be displayed on Overlay Window.
-                Caption.OverlayOriginalCaption = latestCaption;
-                for (int historyCount = Math.Min(Setting.DisplaySentences, Caption.Contexts.Count);
-                     historyCount > 0 && lastEOSIndex > 0;
-                     historyCount--)
+                fullText = NormalizeCaption(fullText);
+                var snapshot = sentenceTracker.Update(fullText);
+                if (snapshot.SourceReset)
                 {
-                    lastEOSIndex = fullText[0..lastEOSIndex].LastIndexOfAny(TextUtil.PUNC_EOS);
-                    Caption.OverlayOriginalCaption = fullText.Substring(lastEOSIndex + 1);
+                    BeginNewSession(clearContexts: true, resetTracker: true);
+                    snapshot = sentenceTracker.Update(fullText);
                 }
 
-                // `DisplayOriginalCaption`: The sentence to be displayed on Main Window.
-                if (string.CompareOrdinal(Caption.DisplayOriginalCaption, latestCaption) != 0)
+                if (snapshot.Sentences.Count == 0)
                 {
-                    Caption.DisplayOriginalCaption = latestCaption;
-                    // If the last sentence is too long, truncate it when displayed.
-                    Caption.DisplayOriginalCaption =
-                        TextUtil.ShortenDisplaySentence(Caption.DisplayOriginalCaption, TextUtil.VERYLONG_THRESHOLD);
+                    Wait(25);
+                    continue;
                 }
 
-                // Prepare for `OriginalCaption`. If Expanded, only retain the complete sentence.
-                int lastEOS = latestCaption.LastIndexOfAny(TextUtil.PUNC_EOS);
-                if (lastEOS != -1)
-                    latestCaption = latestCaption.Substring(0, lastEOS + 1);
-                // `OriginalCaption`: The sentence to be really translated.
-                if (string.CompareOrdinal(Caption.OriginalCaption, latestCaption) != 0)
+                var latest = snapshot.Sentences[^1];
+                bool sentenceChanged;
+                lock (stateLock)
                 {
-                    Caption.OriginalCaption = latestCaption;
-
-                    idleCount = 0;
-                    if (Array.IndexOf(TextUtil.PUNC_EOS, Caption.OriginalCaption[^1]) != -1)
-                    {
-                        syncCount = 0;
-                        pendingTextQueue.Enqueue(Caption.OriginalCaption);
-                    }
-                    else if (Encoding.UTF8.GetByteCount(Caption.OriginalCaption) >= TextUtil.SHORT_THRESHOLD)
-                        syncCount++;
+                    sentenceChanged = currentSentenceId != latest.Id;
+                    currentSentenceId = latest.Id;
                 }
-                else
-                    idleCount++;
+                UpdateOriginalDisplay(snapshot, latest, sentenceChanged);
 
-                // `TranslateFlag` determines whether this sentence should be translated.
-                // When `OriginalCaption` remains unchanged, `idleCount` +1; when `OriginalCaption` changes, `MaxSyncInterval` +1.
-                if (syncCount > Setting.MaxSyncInterval ||
-                    idleCount == Setting.MaxIdleInterval)
+                foreach (var sentence in snapshot.Sentences)
                 {
-                    syncCount = 0;
-                    pendingTextQueue.Enqueue(Caption.OriginalCaption);
+                    if (!sentence.Changed)
+                        continue;
+                    ScheduleSentence(sentence);
                 }
 
-                Thread.Sleep(25);
+                TrySubmitNext();
+                Wait(25);
             }
         }
 
-        public static async Task TranslateLoop()
+        public static void ConfigurationChanged()
         {
-            while (true)
+            if (!initialized)
+                return;
+            BeginNewSession(clearContexts: true, resetTracker: true);
+        }
+
+        public static void ClearContexts() => Caption.ClearContexts();
+
+        public static void Shutdown()
+        {
+            lifetime.Cancel();
+            translationTaskQueue.CancelAll();
+            BeginNewSession(clearContexts: false, resetTracker: true);
+        }
+
+        private static void ScheduleSentence(CaptionSentence sentence)
+        {
+            lock (stateLock)
             {
-                // Check LiveCaptions.exe still alive
-                if (Window == null)
-                {
-                    Caption.DisplayTranslatedCaption = "[WARNING] LiveCaptions was unexpectedly closed, restarting...";
-                    Window = LiveCaptionsHandler.LaunchLiveCaptions();
-                    Caption.DisplayTranslatedCaption = "";
-                }
+                latestRevisions[sentence.Id] = sentence.Revision;
+                pending[sentence.Id] = new PendingCaption(
+                    sentence.Id,
+                    sentence.Revision,
+                    sentence.Text,
+                    sentence.IsFinal,
+                    DateTimeOffset.UtcNow,
+                    pending.TryGetValue(sentence.Id, out var previous) ? previous.LastSubmitted : null);
+            }
 
-                // Translate
-                if (pendingTextQueue.Count > 0)
-                {
-                    var originalSnapshot = pendingTextQueue.Dequeue();
+            TrySubmitNext();
+        }
 
-                    if (LogOnlyFlag)
+        private static void TrySubmitNext()
+        {
+            TranslationRequest? request = null;
+            lock (stateLock)
+            {
+                if (activeRequest != null)
+                {
+                    if (pending.TryGetValue(activeRequest.SentenceId, out var revision) &&
+                        revision.Revision > activeRequest.Revision)
                     {
-                        bool isOverwrite = await IsOverwrite(originalSnapshot);
-                        await LogOnly(originalSnapshot, isOverwrite);
+                        activeRequest = null;
                     }
                     else
                     {
-                        translationTaskQueue.Enqueue(token => Task.Run(
-                            () => Translate(originalSnapshot, token), token), originalSnapshot);
+                        return;
                     }
                 }
 
-                Thread.Sleep(40);
-            }
-        }
+                var now = DateTimeOffset.UtcNow;
+                var candidate = pending.Values
+                    .Where(item => item.IsFinal ||
+                        now - item.LastChanged >= TranslationMaxWait ||
+                        item.LastSubmitted == null || now - item.LastSubmitted >= TranslationThrottle)
+                    .OrderBy(item => item.SentenceId)
+                    .FirstOrDefault();
+                if (candidate == null)
+                    return;
 
-        public static async Task DisplayLoop()
-        {
-            while (true)
-            {
-                var (translatedText, isChoke) = translationTaskQueue.Output;
-
-                if (LogOnlyFlag)
-                {
-                    Caption.TranslatedCaption = string.Empty;
-                    Caption.DisplayTranslatedCaption = "[Paused]";
-                    Caption.OverlayNoticePrefix = "[Paused]";
-                    Caption.OverlayCurrentTranslation = string.Empty;
-                }
-                else if (!string.IsNullOrEmpty(RegexPatterns.NoticePrefix().Replace(
-                             translatedText, string.Empty).Trim()) &&
-                         string.CompareOrdinal(Caption.TranslatedCaption, translatedText) != 0)
-                {
-                    // Main page
-                    Caption.TranslatedCaption = translatedText;
-                    Caption.DisplayTranslatedCaption =
-                        TextUtil.ShortenDisplaySentence(Caption.TranslatedCaption, TextUtil.VERYLONG_THRESHOLD);
-
-                    // Overlay window
-                    if (Caption.TranslatedCaption.Contains("[ERROR]") || Caption.TranslatedCaption.Contains("[WARNING]"))
-                        Caption.OverlayCurrentTranslation = Caption.TranslatedCaption;
-                    else
-                    {
-                        var match = RegexPatterns.NoticePrefixAndTranslation().Match(Caption.TranslatedCaption);
-                        Caption.OverlayNoticePrefix = match.Groups[1].Value.Trim();
-                        Caption.OverlayCurrentTranslation = match.Groups[2].Value.Trim();
-                    }
-                }
-
-                // If the original sentence is a complete sentence, choke for better visual experience.
-                if (isChoke)
-                    Thread.Sleep(720);
-                Thread.Sleep(40);
-            }
-        }
-
-        public static async Task<(string, bool)> Translate(string text, CancellationToken token = default)
-        {
-            string translatedText;
-            bool isChoke = Array.IndexOf(TextUtil.PUNC_EOS, text[^1]) != -1;
-
-            try
-            {
-                var sw = Setting.MainWindow.LatencyShow ? Stopwatch.StartNew() : null;
-
-                if (Setting.ContextAware && !TranslateAPI.IsLLMBased)
-                {
-                    translatedText = await TranslateAPI.TranslateFunction($"{Caption.AwareContextsCaption} 🔤 {text} 🔤", token);
-                    translatedText = RegexPatterns.TargetSentence().Match(translatedText).Groups[1].Value;
-                }
-                else
-                {
-                    translatedText = await TranslateAPI.TranslateFunction(text, token);
-                    translatedText = translatedText.Replace("🔤", "");
-                }
-
-                if (sw != null)
-                {
-                    sw.Stop();
-                    translatedText = $"[{sw.ElapsedMilliseconds,4} ms] " + translatedText;
-                }
-            }
-            catch (OperationCanceledException ex)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                return ($"[ERROR] Translation Failed: {ex.Message}", isChoke);
+                request = CreateRequest(candidate);
+                candidate.LastSubmitted = now;
+                activeRequest = request;
             }
 
-            return (translatedText, isChoke);
-        }
-
-        public static async Task Log(string originalText, string translatedText,
-            bool isOverwrite = false, CancellationToken token = default)
-        {
-            string targetLanguage, apiName;
-            if (Setting != null)
-            {
-                targetLanguage = Setting.TargetLanguage;
-                apiName = Setting.ApiName;
-            }
+            if (request == null)
+                return;
+            if (LogOnlyFlag)
+                _ = CommitLogOnlyAsync(request);
             else
-            {
-                targetLanguage = "N/A";
-                apiName = "N/A";
-            }
-
-            try
-            {
-                if (isOverwrite)
-                    await SQLiteHistoryLogger.DeleteLastTranslation(token);
-                await SQLiteHistoryLogger.LogTranslation(originalText, translatedText, targetLanguage, apiName);
-                TranslationLogged?.Invoke();
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                SnackbarHost.Show("[ERROR] Logging history failed.", ex.Message, SnackbarType.Error,
-                    timeout: 2, closeButton: true);
-            }
+                translationTaskQueue.Enqueue(request);
         }
 
-        public static async Task LogOnly(string originalText,
-            bool isOverwrite = false, CancellationToken token = default)
+        private static TranslationRequest CreateRequest(PendingCaption candidate)
         {
-            try
-            {
-                if (isOverwrite)
-                    await SQLiteHistoryLogger.DeleteLastTranslation(token);
-                await SQLiteHistoryLogger.LogTranslation(originalText, "N/A", "N/A", "LogOnly");
-                TranslationLogged?.Invoke();
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                SnackbarHost.Show("[ERROR] Logging history failed.", ex.Message, SnackbarType.Error,
-                    timeout: 2, closeButton: true);
-            }
+            var contexts = Setting.ContextAware
+                ? Caption.GetAwareContextSnapshot(Setting.NumContexts)
+                : Array.Empty<TranslationContext>();
+            return new TranslationRequest(
+                sessionId,
+                candidate.SentenceId,
+                candidate.Revision,
+                candidate.Text,
+                candidate.IsFinal,
+                contexts,
+                Setting.CreateTranslationSnapshot());
         }
 
-        public static async Task AddContexts(CancellationToken token = default)
+        private static async void OnTranslationUpdated(TranslationTaskUpdate update)
         {
-            var lastLog = await SQLiteHistoryLogger.LoadLastTranslation(token);
-            if (lastLog == null)
+            if (!IsCurrentRequest(update.Request))
                 return;
 
-            if (Caption?.Contexts.Count >= Caption.MAX_CONTEXTS)
-                Caption.Contexts.Dequeue();
-            Caption?.Contexts.Enqueue(lastLog);
+            if (update.Kind == TranslationUpdateKind.Text || update.Kind == TranslationUpdateKind.Completed)
+            {
+                if (IsCurrentDisplayedSentence(update.Request))
+                    await UpdateTranslationDisplayAsync(update.Text);
+            }
+            else if (update.Kind is TranslationUpdateKind.Failed or TranslationUpdateKind.Incomplete)
+            {
+                if (IsCurrentDisplayedSentence(update.Request))
+                {
+                    string prefix = update.Kind == TranslationUpdateKind.Failed ? "[ERROR]" : "[WARNING]";
+                    await UpdateTranslationDisplayAsync($"{prefix} {update.Error ?? "Translation did not complete."}");
+                }
+            }
 
-            Caption?.OnPropertyChanged("DisplayLogCards");
-            Caption?.OnPropertyChanged("OverlayPreviousTranslation");
+            if (update.Kind == TranslationUpdateKind.Completed)
+            {
+                if (update.Request.IsFinal && !LogOnlyFlag && !string.IsNullOrWhiteSpace(update.Text))
+                    await CommitTranslationAsync(update.Request, update.Text);
+                FinishRequest(update.Request);
+            }
+            else if (update.Kind is TranslationUpdateKind.Failed or TranslationUpdateKind.Incomplete)
+            {
+                FinishRequest(update.Request);
+            }
         }
 
-        public static void ClearContexts()
+        private static async Task CommitTranslationAsync(TranslationRequest request, string translatedText)
         {
-            Caption?.Contexts.Clear();
-
-            Caption?.OnPropertyChanged("DisplayLogCards");
-            Caption?.OnPropertyChanged("OverlayPreviousTranslation");
+            bool entered = false;
+            try
+            {
+                await historyLock.WaitAsync(lifetime.Token);
+                entered = true;
+                if (!IsCurrentRequest(request))
+                    return;
+                var entry = await SQLiteHistoryLogger.UpsertTranslation(request, translatedText, lifetime.Token);
+                await RunOnUiAsync(() =>
+                {
+                    if (IsCurrentRequest(request))
+                    {
+                        Caption.UpsertContext(entry);
+                        TranslationLogged?.Invoke();
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                await RunOnUiAsync(() => SnackbarHost.Show(
+                    "[ERROR] Logging history failed.", ex.Message, SnackbarType.Error,
+                    timeout: 2, closeButton: true));
+            }
+            finally
+            {
+                if (entered)
+                    historyLock.Release();
+            }
         }
 
-        // If this text is too similar to the last one, overwrite it when logging.
-        public static async Task<bool> IsOverwrite(string originalText, CancellationToken token = default)
+        private static async Task CommitLogOnlyAsync(TranslationRequest request)
         {
-            string lastOriginalText = await SQLiteHistoryLogger.LoadLastSourceText(token);
-            if (lastOriginalText == null)
-                return false;
+            bool entered = false;
+            try
+            {
+                await historyLock.WaitAsync(lifetime.Token);
+                entered = true;
+                if (request.IsFinal && IsCurrentRequest(request))
+                {
+                    var entry = await SQLiteHistoryLogger.UpsertTranslation(request, "N/A", lifetime.Token);
+                    await RunOnUiAsync(() =>
+                    {
+                        if (IsCurrentRequest(request))
+                        {
+                            Caption.UpsertContext(entry);
+                            TranslationLogged?.Invoke();
+                        }
+                    });
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                if (entered)
+                    historyLock.Release();
+                FinishRequest(request);
+            }
+        }
 
-            int minLen = Math.Min(originalText.Length, lastOriginalText.Length);
-            originalText = originalText.Substring(0, minLen);
-            lastOriginalText = lastOriginalText.Substring(0, minLen);
+        private static void FinishRequest(TranslationRequest request)
+        {
+            lock (stateLock)
+            {
+                if (activeRequest?.SessionId != request.SessionId ||
+                    activeRequest.SentenceId != request.SentenceId ||
+                    activeRequest.Revision != request.Revision)
+                    return;
+                activeRequest = null;
+                if (request.IsFinal && pending.TryGetValue(request.SentenceId, out var item) &&
+                    item.Revision == request.Revision)
+                    pending.Remove(request.SentenceId);
+            }
+            TrySubmitNext();
+        }
 
-            double similarity = TextUtil.Similarity(originalText, lastOriginalText);
-            return similarity > TextUtil.SIM_THRESHOLD;
+        private static bool IsCurrentRequest(TranslationRequest request)
+        {
+            lock (stateLock)
+            {
+                return request.SessionId == sessionId &&
+                    latestRevisions.TryGetValue(request.SentenceId, out var revision) &&
+                    revision == request.Revision;
+            }
+        }
+
+        private static bool IsCurrentDisplayedSentence(TranslationRequest request)
+        {
+            lock (stateLock)
+                return currentSentenceId == request.SentenceId;
+        }
+
+        private static void UpdateOriginalDisplay(CaptionSnapshot snapshot, CaptionSentence latest, bool sentenceChanged)
+        {
+            string overlay = string.Join(" ", snapshot.Sentences
+                .TakeLast(Math.Max(1, Setting.DisplaySentences + 1))
+                .Select(sentence => sentence.Text));
+            UpdateCaption(() =>
+            {
+                Caption.OverlayOriginalCaption = overlay;
+                Caption.DisplayOriginalCaption = TextUtil.ShortenDisplaySentence(
+                    latest.Text, TextUtil.VERYLONG_THRESHOLD);
+                Caption.OriginalCaption = latest.Text;
+                if (sentenceChanged)
+                {
+                    Caption.TranslatedCaption = string.Empty;
+                    Caption.DisplayTranslatedCaption = string.Empty;
+                    Caption.OverlayCurrentTranslation = string.Empty;
+                    Caption.OverlayNoticePrefix = string.Empty;
+                }
+                if (LogOnlyFlag)
+                {
+                    Caption.DisplayTranslatedCaption = "[Paused]";
+                    Caption.OverlayNoticePrefix = "[Paused]";
+                }
+            });
+        }
+
+        private static async Task UpdateTranslationDisplayAsync(string translatedText)
+        {
+            await RunOnUiAsync(() =>
+            {
+                if (string.IsNullOrWhiteSpace(translatedText))
+                    return;
+                Caption.TranslatedCaption = translatedText;
+                Caption.DisplayTranslatedCaption = TextUtil.ShortenDisplaySentence(
+                    translatedText, TextUtil.VERYLONG_THRESHOLD);
+                if (translatedText.Contains("[ERROR]", StringComparison.Ordinal) ||
+                    translatedText.Contains("[WARNING]", StringComparison.Ordinal))
+                {
+                    Caption.OverlayNoticePrefix = string.Empty;
+                    Caption.OverlayCurrentTranslation = translatedText;
+                    return;
+                }
+
+                var match = RegexPatterns.NoticePrefixAndTranslation().Match(translatedText);
+                Caption.OverlayNoticePrefix = match.Groups[1].Value.Trim();
+                Caption.OverlayCurrentTranslation = match.Groups[2].Value.Trim();
+            });
+        }
+
+        private static void BeginNewSession(bool clearContexts, bool resetTracker)
+        {
+            lock (stateLock)
+            {
+                sessionId = Guid.NewGuid();
+                currentSentenceId = null;
+                activeRequest = null;
+                pending.Clear();
+                latestRevisions.Clear();
+                if (resetTracker)
+                    sentenceTracker.Reset();
+            }
+            translationTaskQueue.CancelAll();
+            if (clearContexts)
+                UpdateCaption(Caption.ClearContexts);
+            UpdateCaption(() =>
+            {
+                Caption.OriginalCaption = string.Empty;
+                Caption.TranslatedCaption = string.Empty;
+                Caption.DisplayOriginalCaption = string.Empty;
+                Caption.DisplayTranslatedCaption = string.Empty;
+                Caption.OverlayOriginalCaption = " ";
+                Caption.OverlayCurrentTranslation = string.Empty;
+                Caption.OverlayNoticePrefix = string.Empty;
+            });
+        }
+
+        private static string NormalizeCaption(string text)
+        {
+            text = RegexPatterns.Acronym().Replace(text, "$1$2");
+            text = RegexPatterns.AcronymWithWords().Replace(text, "$1 $2");
+            text = RegexPatterns.PunctuationSpace().Replace(text, "$1 ");
+            text = RegexPatterns.CJPunctuationSpace().Replace(text, "$1");
+            return TextUtil.ReplaceNewlines(text, TextUtil.MEDIUM_THRESHOLD);
+        }
+
+        private static void UpdateCaption(Action action)
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+                action();
+            else
+                dispatcher.BeginInvoke(action);
+        }
+
+        private static Task RunOnUiAsync(Action action)
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+            {
+                action();
+                return Task.CompletedTask;
+            }
+            return dispatcher.InvokeAsync(action).Task;
+        }
+
+        private static void Wait(int milliseconds)
+        {
+            lifetime.Token.WaitHandle.WaitOne(milliseconds);
+        }
+
+        private sealed class PendingCaption
+        {
+            public long SentenceId { get; }
+            public int Revision { get; }
+            public string Text { get; }
+            public bool IsFinal { get; }
+            public DateTimeOffset LastChanged { get; }
+            public DateTimeOffset? LastSubmitted { get; set; }
+
+            public PendingCaption(
+                long sentenceId,
+                int revision,
+                string text,
+                bool isFinal,
+                DateTimeOffset lastChanged,
+                DateTimeOffset? lastSubmitted)
+            {
+                SentenceId = sentenceId;
+                Revision = revision;
+                Text = text;
+                IsFinal = isFinal;
+                LastChanged = lastChanged;
+                LastSubmitted = lastSubmitted;
+            }
         }
     }
 }

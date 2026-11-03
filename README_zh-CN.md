@@ -81,6 +81,8 @@ Windows内置的实时字幕简单易用，资源占用少，且识别准确率�
 
   </div>
 
+OpenAI 设置支持选择 **Chat Completions** 或 **Responses** 协议。请输入完整的 endpoint URL（通常以 `/v1/chat/completions` 或 `/v1/responses` 结尾），只有在所选 endpoint 支持时才启用 **Streaming**。OpenRouter、Ollama 和 LM Studio 当前仍使用现有的完整返回路径；新的流式事件处理仅适用于 OpenAI 协议。
+
   强烈推荐使用 **基于LLM** 的翻译引擎，因为LLM擅长处理不完整的句子并能很好地理解上下文。
 
 - **🪟 悬浮窗口**

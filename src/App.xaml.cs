@@ -12,12 +12,11 @@ namespace LiveCaptionsTranslator
             Translator.Setting?.Save();
 
             Task.Run(() => Translator.SyncLoop());
-            Task.Run(() => Translator.TranslateLoop());
-            Task.Run(() => Translator.DisplayLoop());
         }
 
         private static void OnProcessExit(object sender, EventArgs e)
         {
+            Translator.Shutdown();
             if (Translator.Window != null)
             {
                 LiveCaptionsHandler.RestoreLiveCaptions(Translator.Window);

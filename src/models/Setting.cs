@@ -32,6 +32,8 @@ namespace LiveCaptionsTranslator.models
 
         private Dictionary<string, List<TranslateAPIConfig>> configs;
         private Dictionary<string, int> configIndices;
+        [JsonIgnore]
+        public long ConfigurationVersion { get; private set; }
 
         public int MaxIdleInterval => maxIdleInterval;
         public int MaxSyncInterval
@@ -219,6 +221,64 @@ namespace LiveCaptionsTranslator.models
                 { "LibreTranslate", 0 }
             };
         }
+        public TranslationSettingsSnapshot CreateTranslationSnapshot()
+        {
+            var config = this[ApiName];
+            var parameters = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["AppKey"] = config is YoudaoConfig youdao ? youdao.AppKey : string.Empty,
+                ["AppSecret"] = config is YoudaoConfig youdaoConfig ? youdaoConfig.AppSecret : string.Empty,
+                ["AppId"] = config is BaiduConfig baidu ? baidu.AppId : string.Empty,
+                ["SourceLanguage"] = config is MTranServerConfig mtran ? mtran.SourceLanguage : string.Empty
+            };
+
+            var llmConfig = config as BaseLLMConfig;
+            var protocol = OpenAIProtocol.ChatCompletions;
+            var stream = false;
+            if (config is OpenAIConfig openAI)
+            {
+                Enum.TryParse(openAI.Protocol, ignoreCase: true, out protocol);
+                stream = openAI.Stream;
+            }
+
+            string apiKey = config switch
+            {
+                OpenAIConfig openAI => openAI.ApiKey,
+                OpenRouterConfig openRouter => openRouter.ApiKey,
+                DeepLConfig deepL => deepL.ApiKey,
+                MTranServerConfig mtranServer => mtranServer.ApiKey,
+                LibreTranslateConfig libre => libre.ApiKey,
+                _ => string.Empty
+            };
+            string apiUrl = config switch
+            {
+                OpenAIConfig openAI => openAI.ApiUrl,
+                OllamaConfig ollama => ollama.ApiUrl,
+                LMStudioConfig lmStudio => lmStudio.ApiUrl,
+                DeepLConfig deepL => deepL.ApiUrl,
+                YoudaoConfig youdao => youdao.ApiUrl,
+                MTranServerConfig mtranServer => mtranServer.ApiUrl,
+                BaiduConfig baidu => baidu.ApiUrl,
+                LibreTranslateConfig libre => libre.ApiUrl,
+                _ => string.Empty
+            };
+
+            return new TranslationSettingsSnapshot(
+                ApiName,
+                ConfigIndices.TryGetValue(ApiName, out var configIndex) ? configIndex : 0,
+                TargetLanguage,
+                Prompt,
+                ContextAware,
+                llmConfig?.ModelName ?? string.Empty,
+                llmConfig?.Temperature ?? 0,
+                apiKey,
+                apiUrl,
+                config is OllamaConfig ollamaConfig ? ollamaConfig.Keep_alive : 0,
+                protocol,
+                stream,
+                ConfigurationVersion,
+                parameters);
+        }
 
         public static Setting Load()
         {
@@ -297,8 +357,11 @@ namespace LiveCaptionsTranslator.models
 
         public void OnPropertyChanged([CallerMemberName] string? propName = null)
         {
+            ConfigurationVersion++;
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propName));
             Translator.Setting?.Save();
+            if (ReferenceEquals(Translator.Setting, this))
+                Translator.ConfigurationChanged();
         }
 
         public static bool IsConfigExist()

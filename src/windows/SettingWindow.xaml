@@ -565,6 +565,7 @@
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="Auto" />
                                                 <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
                                             </Grid.RowDefinitions>
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto" />
@@ -613,9 +614,11 @@
                                                         <ui:TextBlock Width="300" TextWrapping="Wrap">
                                                             <Run Text="Use Full Url (typically ending with" />
                                                             <Run FontWeight="Bold" Text="`v1/chat/completions`" />
-                                                            <Run Text=") instead of Base Url (typically ending with just" />
+                                                            <Run Text="for Chat Completions or" />
+                                                            <Run FontWeight="Bold" Text="`v1/responses`" />
+                                                            <Run Text="for Responses, instead of a Base Url (typically ending with just" />
                                                             <Run FontWeight="Bold" Text="`v1`" />
-                                                            <Run Text=")." />
+                                                            <Run Text="). Streaming requires support from the selected endpoint." />
                                                         </ui:TextBlock>
                                                     </ui:Flyout>
                                                     <Button
@@ -650,6 +653,37 @@
                                                     Padding="10,4,10,7"
                                                     FontSize="13.3"
                                                     Text="{Binding [OpenAI].ApiKey, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            </StackPanel>
+                                            <StackPanel
+                                                Grid.Row="2"
+                                                Grid.Column="0"
+                                                Margin="15,10,0,0"
+                                                Orientation="Vertical">
+                                                <ui:TextBlock Margin="2.5,0,0,5" Text="Protocol" />
+                                                <ComboBox
+                                                    Width="200"
+                                                    Height="30"
+                                                    Padding="10,4,10,7"
+                                                    FontSize="13.3"
+                                                    SelectedValue="{Binding [OpenAI].Protocol, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                    SelectedValuePath="Tag">
+                                                    <ComboBoxItem Content="Chat Completions" Tag="ChatCompletions" />
+                                                    <ComboBoxItem Content="Responses" Tag="Responses" />
+                                                </ComboBox>
+                                            </StackPanel>
+                                            <StackPanel
+                                                Grid.Row="2"
+                                                Grid.Column="1"
+                                                Margin="15,10,0,0"
+                                                Orientation="Vertical">
+                                                <ui:TextBlock Margin="2.5,0,0,5" Text="Streaming" />
+                                                <ui:ToggleSwitch
+                                                    Width="100"
+                                                    Height="30"
+                                                    Padding="10,4,10,7"
+                                                    IsChecked="{Binding [OpenAI].Stream, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                    OffContent="Off"
+                                                    OnContent="On" />
                                             </StackPanel>
                                         </Grid>
                                     </StackPanel>

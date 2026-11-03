@@ -1,8 +1,8 @@
-﻿using System.IO;
+﻿using System.Globalization;
 using System.Text;
-using System.Globalization;
-using Microsoft.Data.Sqlite;
+
 using CsvHelper;
+using Microsoft.Data.Sqlite;
 
 using LiveCaptionsTranslator.models;
 
@@ -12,8 +12,9 @@ namespace LiveCaptionsTranslator.utils
     {
         public static readonly string CONNECTION_STRING = "Data Source=translation_history.db;";
 
-        private static SqliteConnection _sharedConnection;
-        private static readonly object _connectionLock = new object();
+        private static SqliteConnection? sharedConnection;
+        private static readonly object connectionLock = new();
+        private static readonly SemaphoreSlim writeLock = new(1, 1);
 
         static SQLiteHistoryLogger()
         {
@@ -22,9 +23,7 @@ namespace LiveCaptionsTranslator.utils
 
         private static void InitializeDatabase()
         {
-            GetConnection();
-
-            using (var command = new SqliteCommand(@"
+            using var command = new SqliteCommand(@"
                 CREATE TABLE IF NOT EXISTS TranslationHistory (
                     Id INTEGER PRIMARY KEY AUTOINCREMENT,
                     Timestamp TEXT,
@@ -32,48 +31,130 @@ namespace LiveCaptionsTranslator.utils
                     TranslatedText TEXT,
                     TargetLanguage TEXT,
                     ApiUsed TEXT
-                );", GetConnection()))
+                );", GetConnection());
+            command.ExecuteNonQuery();
+
+            EnsureColumn("SessionId", "TEXT");
+            EnsureColumn("SentenceId", "INTEGER");
+            EnsureColumn("Revision", "INTEGER");
+        }
+
+        private static void EnsureColumn(string name, string type)
+        {
+            try
             {
+                using var command = new SqliteCommand(
+                    $"ALTER TABLE TranslationHistory ADD COLUMN {name} {type};", GetConnection());
                 command.ExecuteNonQuery();
+            }
+            catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+            {
             }
         }
 
         private static SqliteConnection GetConnection()
         {
-            lock (_connectionLock)
+            lock (connectionLock)
             {
-                if (_sharedConnection == null)
+                if (sharedConnection == null)
                 {
-                    _sharedConnection = new SqliteConnection(CONNECTION_STRING);
-                    _sharedConnection.Open();
+                    sharedConnection = new SqliteConnection(CONNECTION_STRING);
+                    sharedConnection.Open();
                 }
-                else if (_sharedConnection.State != System.Data.ConnectionState.Open)
+                else if (sharedConnection.State != System.Data.ConnectionState.Open)
                 {
-                    try
-                    {
-                        _sharedConnection.Open();
-                    }
-                    catch
-                    {
-                        _sharedConnection.Dispose();
-                        _sharedConnection = new SqliteConnection(CONNECTION_STRING);
-                        _sharedConnection.Open();
-                    }
+                    sharedConnection.Dispose();
+                    sharedConnection = new SqliteConnection(CONNECTION_STRING);
+                    sharedConnection.Open();
                 }
-
-                return _sharedConnection;
+                return sharedConnection;
             }
         }
 
-        public static async Task LogTranslation(string sourceText, string translatedText,
-            string targetLanguage, string apiUsed, CancellationToken token = default)
+        public static async Task<TranslationHistoryEntry> UpsertTranslation(
+            TranslationRequest request,
+            string translatedText,
+            CancellationToken token = default)
         {
-            string insertQuery = @"
-                INSERT INTO TranslationHistory (Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed)
-                VALUES (@Timestamp, @SourceText, @TranslatedText, @TargetLanguage, @ApiUsed)";
-
-            using (var command = new SqliteCommand(insertQuery, GetConnection()))
+            await writeLock.WaitAsync(token);
+            try
             {
+                var connection = GetConnection();
+                long? existingId = null;
+                using (var select = new SqliteCommand(@"
+                    SELECT Id FROM TranslationHistory
+                    WHERE SessionId = @SessionId AND SentenceId = @SentenceId
+                    LIMIT 1", connection))
+                {
+                    select.Parameters.AddWithValue("@SessionId", request.SessionId.ToString());
+                    select.Parameters.AddWithValue("@SentenceId", request.SentenceId);
+                    var value = await select.ExecuteScalarAsync(token);
+                    if (value != null && value != DBNull.Value)
+                        existingId = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+                }
+
+                long id;
+                if (existingId.HasValue)
+                {
+                    using var update = new SqliteCommand(@"
+                        UPDATE TranslationHistory
+                        SET Timestamp = @Timestamp,
+                            SourceText = @SourceText,
+                            TranslatedText = @TranslatedText,
+                            TargetLanguage = @TargetLanguage,
+                            ApiUsed = @ApiUsed,
+                            Revision = @Revision
+                        WHERE Id = @Id", connection);
+                    AddTranslationParameters(update, request, translatedText);
+                    update.Parameters.AddWithValue("@Id", existingId.Value);
+                    await update.ExecuteNonQueryAsync(token);
+                    id = existingId.Value;
+                }
+                else
+                {
+                    using var insert = new SqliteCommand(@"
+                        INSERT INTO TranslationHistory
+                            (Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed,
+                             SessionId, SentenceId, Revision)
+                        VALUES
+                            (@Timestamp, @SourceText, @TranslatedText, @TargetLanguage, @ApiUsed,
+                             @SessionId, @SentenceId, @Revision);
+                        SELECT last_insert_rowid();", connection);
+                    AddTranslationParameters(insert, request, translatedText);
+                    id = Convert.ToInt64(await insert.ExecuteScalarAsync(token), CultureInfo.InvariantCulture);
+                }
+
+                return CreateEntry(
+                    id,
+                    request.SessionId,
+                    request.SentenceId,
+                    request.Revision,
+                    request.Text,
+                    translatedText,
+                    request.Settings.TargetLanguage,
+                    request.Settings.ApiName,
+                    DateTimeOffset.UtcNow);
+            }
+            finally
+            {
+                writeLock.Release();
+            }
+        }
+
+        public static async Task LogTranslation(
+            string sourceText,
+            string translatedText,
+            string targetLanguage,
+            string apiUsed,
+            CancellationToken token = default)
+        {
+            await writeLock.WaitAsync(token);
+            try
+            {
+                using var command = new SqliteCommand(@"
+                    INSERT INTO TranslationHistory
+                        (Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed)
+                    VALUES (@Timestamp, @SourceText, @TranslatedText, @TargetLanguage, @ApiUsed)", GetConnection());
                 command.Parameters.AddWithValue("@Timestamp", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
                 command.Parameters.AddWithValue("@SourceText", sourceText);
                 command.Parameters.AddWithValue("@TranslatedText", translatedText);
@@ -81,163 +162,91 @@ namespace LiveCaptionsTranslator.utils
                 command.Parameters.AddWithValue("@ApiUsed", apiUsed);
                 await command.ExecuteNonQueryAsync(token);
             }
+            finally
+            {
+                writeLock.Release();
+            }
         }
 
         public static async Task<(List<TranslationHistoryEntry>, int)> LoadHistoryAsync(
-            int page, int maxRow, string searchText, CancellationToken token = default)
+            int page,
+            int maxRow,
+            string searchText,
+            CancellationToken token = default)
         {
             var history = new List<TranslationHistoryEntry>();
-            int totalCount = 0;
-            using (var command = new SqliteCommand(@"
-                SELECT COUNT(*) 
-                FROM TranslationHistory
-                WHERE SourceText LIKE @search OR TranslatedText LIKE @search", GetConnection()))
-
+            int totalCount;
+            using (var count = new SqliteCommand(@"
+                SELECT COUNT(*) FROM TranslationHistory
+                WHERE SourceText LIKE @Search OR TranslatedText LIKE @Search", GetConnection()))
             {
-                command.Parameters.AddWithValue("@search", $"%{searchText}%");
-                totalCount = Convert.ToInt32(await command.ExecuteScalarAsync(token));
+                count.Parameters.AddWithValue("@Search", $"%{searchText}%");
+                totalCount = Convert.ToInt32(await count.ExecuteScalarAsync(token), CultureInfo.InvariantCulture);
             }
 
-            // 计算最大页数，至少为 1
             int maxPage = Math.Max(1, (int)Math.Ceiling(totalCount / (double)maxRow));
             int offset = Math.Max(0, (page - 1) * maxRow);
-
-            using (var command = new SqliteCommand(@"
-                SELECT Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed
+            using var command = new SqliteCommand(@"
+                SELECT Id, Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed,
+                       SessionId, SentenceId, Revision
                 FROM TranslationHistory
-                WHERE SourceText LIKE @search OR TranslatedText LIKE @search
-                ORDER BY Timestamp DESC
-                LIMIT @maxRow OFFSET @offset", GetConnection()))
+                WHERE SourceText LIKE @Search OR TranslatedText LIKE @Search
+                ORDER BY Id DESC
+                LIMIT @MaxRow OFFSET @Offset", GetConnection());
+            command.Parameters.AddWithValue("@Search", $"%{searchText}%");
+            command.Parameters.AddWithValue("@MaxRow", maxRow);
+            command.Parameters.AddWithValue("@Offset", offset);
 
-            {
-                command.Parameters.AddWithValue("@search", $"%{searchText}%");
-                command.Parameters.AddWithValue("@maxRow", maxRow);
-                command.Parameters.AddWithValue("@offset", offset);
-
-                using (var reader = await command.ExecuteReaderAsync(token))
-                {
-                    while (await reader.ReadAsync(token))
-                    {
-                        string unixTime = reader.GetString(reader.GetOrdinal("Timestamp"));
-                        DateTime localTime;
-                        try
-                        {
-                            localTime = DateTimeOffset.FromUnixTimeSeconds((long)Convert.ToDouble(unixTime)).LocalDateTime;
-                        }
-                        catch (FormatException)
-                        {
-                            // DEPRECATED
-                            await MigrateOldTimestampFormat();
-                            return await LoadHistoryAsync(page, maxRow, string.Empty);
-                        }
-                        history.Add(new TranslationHistoryEntry
-                        {
-                            Timestamp = localTime.ToString("yyyy-MM-dd HH:mm"),
-                            TimestampFull = localTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                            SourceText = reader.GetString(reader.GetOrdinal("SourceText")),
-                            TranslatedText = reader.GetString(reader.GetOrdinal("TranslatedText")),
-                            TargetLanguage = reader.GetString(reader.GetOrdinal("TargetLanguage")),
-                            ApiUsed = reader.GetString(reader.GetOrdinal("ApiUsed"))
-                        });
-                    }
-                }
-            }
+            using var reader = await command.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token))
+                history.Add(ReadEntry(reader));
             return (history, maxPage);
         }
 
         public static async Task ClearHistory(CancellationToken token = default)
         {
-            string selectQuery = "DELETE FROM TranslationHistory; DELETE FROM sqlite_sequence WHERE NAME='TranslationHistory'";
-            using (var command = new SqliteCommand(selectQuery, GetConnection()))
+            await writeLock.WaitAsync(token);
+            try
             {
+                using var command = new SqliteCommand(
+                    "DELETE FROM TranslationHistory; DELETE FROM sqlite_sequence WHERE NAME='TranslationHistory'",
+                    GetConnection());
                 await command.ExecuteNonQueryAsync(token);
+            }
+            finally
+            {
+                writeLock.Release();
             }
         }
 
         public static async Task<string> LoadLastSourceText(CancellationToken token = default)
         {
-            string selectQuery = @"
-                SELECT SourceText
-                FROM TranslationHistory
-                ORDER BY Id DESC
-                LIMIT 1";
-
-            using (var command = new SqliteCommand(selectQuery, GetConnection()))
-            using (var reader = await command.ExecuteReaderAsync(token))
-            {
-                if (await reader.ReadAsync(token))
-                    return reader.GetString(reader.GetOrdinal("SourceText"));
-                else
-                    return string.Empty;
-            }
+            using var command = new SqliteCommand(
+                "SELECT SourceText FROM TranslationHistory ORDER BY Id DESC LIMIT 1", GetConnection());
+            return (await command.ExecuteScalarAsync(token))?.ToString() ?? string.Empty;
         }
 
         public static async Task<TranslationHistoryEntry?> LoadLastTranslation(CancellationToken token = default)
         {
-            string selectQuery = @"
-                SELECT Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed
-                FROM TranslationHistory
-                ORDER BY Id DESC
-                LIMIT 1";
-
-            using (var command = new SqliteCommand(selectQuery, GetConnection()))
-            using (var reader = await command.ExecuteReaderAsync(token))
-            {
-                if (await reader.ReadAsync(token))
-                {
-                    string unixTime = reader.GetString(reader.GetOrdinal("Timestamp"));
-                    DateTime localTime = DateTimeOffset.FromUnixTimeSeconds((long)Convert.ToDouble(unixTime)).LocalDateTime;
-                    return new TranslationHistoryEntry
-                    {
-                        Timestamp = localTime.ToString("yyyy-MM-dd HH:mm"),
-                        TimestampFull = localTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                        SourceText = reader.GetString(reader.GetOrdinal("SourceText")),
-                        TranslatedText = reader.GetString(reader.GetOrdinal("TranslatedText")),
-                        TargetLanguage = reader.GetString(reader.GetOrdinal("TargetLanguage")),
-                        ApiUsed = reader.GetString(reader.GetOrdinal("ApiUsed"))
-                    };
-                }
-                return null;
-            }
-        }
-
-        public static async Task DeleteLastTranslation(CancellationToken token = default)
-        {
-            using (var command = new SqliteCommand(@"
-                DELETE FROM TranslationHistory
-                WHERE Id IN (SELECT Id FROM TranslationHistory ORDER BY Id DESC LIMIT 1)",
-                GetConnection()))
-            {
-                await command.ExecuteNonQueryAsync(token);
-            }
+            using var command = new SqliteCommand(@"
+                SELECT Id, Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed,
+                       SessionId, SentenceId, Revision
+                FROM TranslationHistory ORDER BY Id DESC LIMIT 1", GetConnection());
+            using var reader = await command.ExecuteReaderAsync(token);
+            return await reader.ReadAsync(token) ? ReadEntry(reader) : null;
         }
 
         public static async Task ExportToCSV(string filePath, CancellationToken token = default)
         {
             var history = new List<TranslationHistoryEntry>();
-
-            string selectQuery = @"
-                SELECT Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed
-                FROM TranslationHistory
-                ORDER BY Timestamp DESC";
-
-            using (var command = new SqliteCommand(selectQuery, GetConnection()))
+            using (var command = new SqliteCommand(@"
+                SELECT Id, Timestamp, SourceText, TranslatedText, TargetLanguage, ApiUsed,
+                       SessionId, SentenceId, Revision
+                FROM TranslationHistory ORDER BY Id DESC", GetConnection()))
             using (var reader = await command.ExecuteReaderAsync(token))
             {
                 while (await reader.ReadAsync(token))
-                {
-                    string unixTime = reader.GetString(reader.GetOrdinal("Timestamp"));
-                    DateTime localTime = DateTimeOffset.FromUnixTimeSeconds((long)Convert.ToDouble(unixTime)).LocalDateTime;
-                    history.Add(new TranslationHistoryEntry
-                    {
-                        Timestamp = localTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                        TimestampFull = localTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                        SourceText = reader.GetString(reader.GetOrdinal("SourceText")),
-                        TranslatedText = reader.GetString(reader.GetOrdinal("TranslatedText")),
-                        TargetLanguage = reader.GetString(reader.GetOrdinal("TargetLanguage")),
-                        ApiUsed = reader.GetString(reader.GetOrdinal("ApiUsed"))
-                    });
-                }
+                    history.Add(ReadEntry(reader));
             }
 
             using var writer = new StreamWriter(filePath, false, new UTF8Encoding(true));
@@ -245,34 +254,73 @@ namespace LiveCaptionsTranslator.utils
             await csvWriter.WriteRecordsAsync(history, token);
         }
 
-        // DEPRECATED
-        private static async Task MigrateOldTimestampFormat()
+        private static void AddTranslationParameters(
+            SqliteCommand command,
+            TranslationRequest request,
+            string translatedText)
         {
-            var records = new List<(long id, string timestamp)>();
-            using (var command = new SqliteCommand("SELECT Id, Timestamp FROM TranslationHistory", GetConnection()))
-            using (var reader = await command.ExecuteReaderAsync())
-            {
-                while (await reader.ReadAsync())
-                {
-                    long id = reader.GetInt64(reader.GetOrdinal("Id"));
-                    string timestamp = reader.GetString(reader.GetOrdinal("Timestamp"));
-                    records.Add((id, timestamp));
-                }
-            }
+            command.Parameters.AddWithValue("@Timestamp", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            command.Parameters.AddWithValue("@SourceText", request.Text);
+            command.Parameters.AddWithValue("@TranslatedText", translatedText);
+            command.Parameters.AddWithValue("@TargetLanguage", request.Settings.TargetLanguage);
+            command.Parameters.AddWithValue("@ApiUsed", request.Settings.ApiName);
+            command.Parameters.AddWithValue("@SessionId", request.SessionId.ToString());
+            command.Parameters.AddWithValue("@SentenceId", request.SentenceId);
+            command.Parameters.AddWithValue("@Revision", request.Revision);
+        }
 
-            foreach (var (id, timestamp) in records)
+        private static TranslationHistoryEntry ReadEntry(SqliteDataReader reader)
+        {
+            DateTimeOffset timestamp = ParseTimestamp(reader["Timestamp"]?.ToString());
+            Guid? sessionId = Guid.TryParse(reader["SessionId"]?.ToString(), out var parsed)
+                ? parsed
+                : null;
+            return CreateEntry(
+                Convert.ToInt64(reader["Id"], CultureInfo.InvariantCulture),
+                sessionId,
+                Convert.ToInt64(reader["SentenceId"] == DBNull.Value ? 0 : reader["SentenceId"], CultureInfo.InvariantCulture),
+                Convert.ToInt32(reader["Revision"] == DBNull.Value ? 0 : reader["Revision"], CultureInfo.InvariantCulture),
+                reader["SourceText"]?.ToString() ?? string.Empty,
+                reader["TranslatedText"]?.ToString() ?? string.Empty,
+                reader["TargetLanguage"]?.ToString() ?? string.Empty,
+                reader["ApiUsed"]?.ToString() ?? string.Empty,
+                timestamp);
+        }
+
+        private static TranslationHistoryEntry CreateEntry(
+            long id,
+            Guid? sessionId,
+            long sentenceId,
+            int revision,
+            string sourceText,
+            string translatedText,
+            string targetLanguage,
+            string apiUsed,
+            DateTimeOffset timestamp)
+        {
+            var localTime = timestamp.LocalDateTime;
+            return new TranslationHistoryEntry
             {
-                if (DateTime.TryParse(timestamp, out DateTime dt))
-                {
-                    long unixTime = ((DateTimeOffset)dt).ToUnixTimeSeconds();
-                    using var updateCommand = new SqliteCommand(
-                        "UPDATE TranslationHistory SET Timestamp = @Timestamp WHERE Id = @Id",
-                        GetConnection());
-                    updateCommand.Parameters.AddWithValue("@Id", id);
-                    updateCommand.Parameters.AddWithValue("@Timestamp", unixTime.ToString());
-                    await updateCommand.ExecuteNonQueryAsync();
-                }
-            }
+                Id = id,
+                SessionId = sessionId,
+                SentenceId = sentenceId,
+                Revision = revision,
+                Timestamp = localTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),
+                TimestampFull = localTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+                SourceText = sourceText,
+                TranslatedText = translatedText,
+                TargetLanguage = targetLanguage,
+                ApiUsed = apiUsed
+            };
+        }
+
+        private static DateTimeOffset ParseTimestamp(string? value)
+        {
+            if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unix))
+                return DateTimeOffset.FromUnixTimeSeconds(unix);
+            if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed))
+                return parsed;
+            return DateTimeOffset.UtcNow;
         }
     }
 }

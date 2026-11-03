@@ -10,8 +10,9 @@ namespace LiveCaptionsTranslator.models
     {
         public const int MAX_CONTEXTS = 10;
 
-        private static Caption? instance = null;
-        public event PropertyChangedEventHandler? PropertyChanged;
+        private static Caption? instance;
+        private readonly object contextsLock = new();
+        private readonly Queue<TranslationHistoryEntry> contexts = new(MAX_CONTEXTS);
 
         private string displayOriginalCaption = string.Empty;
         private string displayTranslatedCaption = string.Empty;
@@ -19,14 +20,22 @@ namespace LiveCaptionsTranslator.models
         private string overlayCurrentTranslation = " ";
         private string overlayNoticePrefix = " ";
 
+        public event PropertyChangedEventHandler? PropertyChanged;
+
         public string OriginalCaption { get; set; } = string.Empty;
         public string TranslatedCaption { get; set; } = string.Empty;
+        public IReadOnlyCollection<TranslationHistoryEntry> Contexts
+        {
+            get
+            {
+                lock (contextsLock)
+                    return contexts.ToArray();
+            }
+        }
 
-        public Queue<TranslationHistoryEntry> Contexts { get; } = new(MAX_CONTEXTS);
-
-        public IEnumerable<TranslationHistoryEntry> AwareContexts => GetPreviousContexts(Translator.Setting.NumContexts);
+        public IEnumerable<TranslationHistoryEntry> AwareContexts =>
+            GetPreviousContexts(Translator.Setting.NumContexts);
         public string AwareContextsCaption => GetPreviousText(Translator.Setting.NumContexts, TextType.Caption);
-
         public IEnumerable<TranslationHistoryEntry> DisplayLogCards =>
             GetPreviousContexts(Translator.Setting.DisplaySentences).Reverse();
 
@@ -36,7 +45,7 @@ namespace LiveCaptionsTranslator.models
             set
             {
                 displayOriginalCaption = value;
-                OnPropertyChanged("DisplayOriginalCaption");
+                OnPropertyChanged();
             }
         }
         public string DisplayTranslatedCaption
@@ -45,17 +54,16 @@ namespace LiveCaptionsTranslator.models
             set
             {
                 displayTranslatedCaption = value;
-                OnPropertyChanged("DisplayTranslatedCaption");
+                OnPropertyChanged();
             }
         }
-
         public string OverlayOriginalCaption
         {
             get => overlayOriginalCaption;
             set
             {
                 overlayOriginalCaption = value;
-                OnPropertyChanged("OverlayOriginalCaption");
+                OnPropertyChanged();
             }
         }
         public string OverlayNoticePrefix
@@ -64,7 +72,7 @@ namespace LiveCaptionsTranslator.models
             set
             {
                 overlayNoticePrefix = value;
-                OnPropertyChanged("OverlayNoticePrefix");
+                OnPropertyChanged();
             }
         }
         public string OverlayCurrentTranslation
@@ -73,10 +81,9 @@ namespace LiveCaptionsTranslator.models
             set
             {
                 overlayCurrentTranslation = value;
-                OnPropertyChanged("OverlayCurrentTranslation");
+                OnPropertyChanged();
             }
         }
-
         public string OverlayPreviousTranslation =>
             GetPreviousText(Translator.Setting.DisplaySentences, TextType.Translation);
 
@@ -86,54 +93,95 @@ namespace LiveCaptionsTranslator.models
 
         public static Caption GetInstance()
         {
-            if (instance != null)
-                return instance;
-            instance = new Caption();
-            return instance;
+            return instance ??= new Caption();
+        }
+
+        public IReadOnlyList<TranslationContext> GetAwareContextSnapshot(int count)
+        {
+            return GetPreviousContexts(count)
+                .Select(entry => new TranslationContext(entry.SourceText, entry.TranslatedText))
+                .ToArray();
+        }
+
+        public void UpsertContext(TranslationHistoryEntry entry)
+        {
+            lock (contextsLock)
+            {
+                var items = contexts.ToList();
+                int index = entry.SessionId.HasValue
+                    ? items.FindIndex(item => item.SessionId == entry.SessionId && item.SentenceId == entry.SentenceId)
+                    : -1;
+                if (index >= 0)
+                    items[index] = entry;
+                else
+                    items.Add(entry);
+
+                while (items.Count > MAX_CONTEXTS)
+                    items.RemoveAt(0);
+                contexts.Clear();
+                foreach (var item in items)
+                    contexts.Enqueue(item);
+            }
+
+            OnPropertyChanged(nameof(DisplayLogCards));
+            OnPropertyChanged(nameof(OverlayPreviousTranslation));
+        }
+
+        public void ClearContexts()
+        {
+            lock (contextsLock)
+                contexts.Clear();
+            OnPropertyChanged(nameof(DisplayLogCards));
+            OnPropertyChanged(nameof(OverlayPreviousTranslation));
         }
 
         public string GetPreviousText(int count, TextType textType)
         {
-            if (count <= 0 || Contexts.Count == 0)
+            var entries = GetPreviousContexts(count).ToList();
+            if (entries.Count == 0)
                 return string.Empty;
 
-            var prev = Contexts
-                .Reverse().Take(count).Reverse()
-                .Select(entry => entry == null || string.CompareOrdinal(entry.TranslatedText, "N/A") == 0 ||
-                                 entry.TranslatedText.Contains("[ERROR]") || entry.TranslatedText.Contains("[WARNING]") ?
-                    "" : (textType == TextType.Caption ? entry.SourceText : entry.TranslatedText))
-                .Aggregate((accu, cur) =>
+            string previous = string.Empty;
+            foreach (var entry in entries)
+            {
+                string current = textType == TextType.Caption ? entry.SourceText : entry.TranslatedText;
+                current = RegexPatterns.NoticePrefix().Replace(current, "");
+                if (string.IsNullOrEmpty(current))
+                    continue;
+                if (!string.IsNullOrEmpty(previous))
                 {
-                    if (!string.IsNullOrEmpty(accu))
-                    {
-                        if (Array.IndexOf(TextUtil.PUNC_EOS, accu[^1]) == -1)
-                            accu += TextUtil.isCJChar(accu[^1]) ? "。" : ". ";
-                        else
-                            accu += TextUtil.isCJChar(accu[^1]) ? "" : " ";
-                    }
-                    cur = RegexPatterns.NoticePrefix().Replace(cur, "");
-                    return accu + cur;
-                });
+                    if (Array.IndexOf(TextUtil.PUNC_EOS, previous[^1]) == -1)
+                        previous += TextUtil.isCJChar(previous[^1]) ? "。" : ". ";
+                    else if (!TextUtil.isCJChar(previous[^1]))
+                        previous += " ";
+                }
+                previous += current;
+            }
 
             if (textType == TextType.Translation)
-                prev = RegexPatterns.NoticePrefix().Replace(prev, "");
-            if (!string.IsNullOrEmpty(prev) && Array.IndexOf(TextUtil.PUNC_EOS, prev[^1]) == -1)
-                prev += TextUtil.isCJChar(prev[^1]) ? "。" : ".";
-            if (!string.IsNullOrEmpty(prev) && Encoding.UTF8.GetByteCount(prev[^1].ToString()) < 2)
-                prev += " ";
-            return prev;
+                previous = RegexPatterns.NoticePrefix().Replace(previous, "");
+            if (!string.IsNullOrEmpty(previous) && Array.IndexOf(TextUtil.PUNC_EOS, previous[^1]) == -1)
+                previous += TextUtil.isCJChar(previous[^1]) ? "。" : ".";
+            if (!string.IsNullOrEmpty(previous) && Encoding.UTF8.GetByteCount(previous[^1].ToString()) < 2)
+                previous += " ";
+            return previous;
         }
 
         public IEnumerable<TranslationHistoryEntry> GetPreviousContexts(int count)
         {
-            if (count <= 0 || Contexts.Count == 0)
+            if (count <= 0)
                 return [];
-
-            return Contexts
-                .Reverse().Take(count).Reverse()
-                .Where(entry => entry != null && string.CompareOrdinal(entry.TranslatedText, "N/A") != 0 &&
-                                !entry.TranslatedText.Contains("[ERROR]") &&
-                                !entry.TranslatedText.Contains("[WARNING]"));
+            lock (contextsLock)
+            {
+                return contexts
+                    .Reverse()
+                    .Take(count)
+                    .Reverse()
+                    .Where(entry => !string.Equals(entry.TranslatedText, "N/A", StringComparison.Ordinal) &&
+                                   !entry.TranslatedText.Contains("[ERROR]", StringComparison.Ordinal) &&
+                                   !entry.TranslatedText.Contains("[WARNING]", StringComparison.Ordinal))
+                    .ToArray();
+            }
         }
 
         public void OnPropertyChanged([CallerMemberName] string propName = "")

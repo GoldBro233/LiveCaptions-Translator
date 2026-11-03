@@ -36,6 +36,8 @@ namespace LiveCaptionsTranslator.models
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propName));
             Translator.Setting?.Save();
+            if (Translator.Setting != null)
+                Translator.ConfigurationChanged();
         }
     }
 
@@ -140,6 +142,8 @@ namespace LiveCaptionsTranslator.models
 
         private string apiKey = "";
         private string apiUrl = "";
+        private string protocol = "ChatCompletions";
+        private bool stream = false;
 
         public string ApiKey
         {
@@ -157,6 +161,24 @@ namespace LiveCaptionsTranslator.models
             {
                 apiUrl = value;
                 OnPropertyChanged("ApiUrl");
+            }
+        }
+        public string Protocol
+        {
+            get => protocol;
+            set
+            {
+                protocol = value;
+                OnPropertyChanged("Protocol");
+            }
+        }
+        public bool Stream
+        {
+            get => stream;
+            set
+            {
+                stream = value;
+                OnPropertyChanged("Stream");
             }
         }
     }

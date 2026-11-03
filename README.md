@@ -81,6 +81,8 @@ Windows' built-in LiveCaptions is easy to use, uses few resources, and has extre
 
   </div>
 
+For OpenAI, choose either **Chat Completions** or **Responses** in the settings. Enter the complete endpoint URL (typically ending in `/v1/chat/completions` or `/v1/responses`) and enable **Streaming** only when the selected endpoint supports it. OpenRouter, Ollama, and LM Studio currently keep their existing complete-response paths; the new streaming event handling is limited to the OpenAI protocols.
+
   It's strongly recommended using **LLM-based** translation engines, as LLMs excel at handling incomplete sentences and are adept at understanding context.
 
 - **🪟 Overlay Window**
